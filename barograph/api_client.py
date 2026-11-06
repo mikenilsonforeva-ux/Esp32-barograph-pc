@@ -1,7 +1,9 @@
 """Клиент REST API барографа ESP32 (только стандартная библиотека)."""
 import csv
+import http.client
 import io
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -9,9 +11,18 @@ import urllib.request
 
 Record = tuple  # (ts:int, pressure_mmHg:float, temperature:float, humidity:float|None)
 
+CSV_HEADER = "timestamp,date,time,pressure_mmHg,temperature_c,humidity"
+_CHUNK = 16 * 1024
+
 
 class DeviceError(Exception):
-    """Ошибка связи с устройством или ответ с ошибкой."""
+    """Ошибка связи с устройством или ответ с ошибкой.
+    code - HTTP-код ответа устройства, error - его поле "error" (например "sd_offline"); у сетевых ошибок None."""
+
+    def __init__(self, message, code=None, error=None):
+        super().__init__(message)
+        self.code = code
+        self.error = error
 
 
 def normalize_host(host: str) -> str:
@@ -35,7 +46,8 @@ class BarographClient:
     def _base(self, host: str) -> str:
         return f"http://{host}" if self.port == 80 else f"http://{host}:{self.port}"
 
-    def _request(self, method: str, path: str, params=None, data=None, timeout=None) -> bytes:
+    def _open(self, method: str, path: str, params=None, data=None, timeout=None):
+        """Открывает соединение (пробуя запасные адреса) и возвращает ответ; закрыть должен вызвавший."""
         hosts = [self.active_host] + [h for h in [self.host] + self.fallback_hosts if h != self.active_host]
         url_path = path
         if params:
@@ -47,25 +59,33 @@ class BarographClient:
             if body is not None:
                 req.add_header("Content-Type", "application/x-www-form-urlencoded")
             try:
-                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                    payload = resp.read()
-                self.active_host = host
-                return payload
+                resp = urllib.request.urlopen(req, timeout=timeout or self.timeout)
             except urllib.error.HTTPError as e:         # устройство ответило ошибкой - не пробуем другие адреса
                 raw = e.read() if hasattr(e, "read") else b""
-                msg = f"HTTP {e.code}"
+                msg, err = f"HTTP {e.code}", None
                 try:
                     j = json.loads(raw.decode("utf-8"))
                     if isinstance(j, dict) and j.get("error"):
-                        msg = f"{j['error']} (HTTP {e.code})"
+                        err = str(j["error"])
+                        msg = f"{err} (HTTP {e.code})"
                 except (ValueError, UnicodeDecodeError):
                     pass
-                raise DeviceError(msg) from None
+                raise DeviceError(msg, code=e.code, error=err) from None
             except (urllib.error.URLError, OSError, TimeoutError) as e:
                 last_exc = e
                 continue
+            self.active_host = host
+            return resp
         reason = getattr(last_exc, "reason", last_exc)
         raise DeviceError(f"Нет связи с устройством ({', '.join(hosts)}): {reason}")
+
+    def _request(self, method: str, path: str, params=None, data=None, timeout=None) -> bytes:
+        resp = self._open(method, path, params, data, timeout)
+        try:
+            with resp:
+                return resp.read()
+        except (OSError, TimeoutError, http.client.HTTPException) as e:
+            raise DeviceError(f"Обрыв связи с устройством: {e}") from None
 
     def get_json(self, path: str, params=None, timeout=None) -> dict:
         raw = self._request("GET", path, params=params, timeout=timeout)
@@ -94,6 +114,20 @@ class BarographClient:
     def history(self, hours: float = 1.0, max_points: int = 400) -> dict:
         return self.get_json("/api/history", {"hours": hours, "max": max_points}, timeout=30)
 
+    def range(self) -> dict:
+        """GET /api/range: за какой период у устройства есть измерения (has_data, first, last, source sd|ram)."""
+        return self.get_json("/api/range")
+
+    def history_range(self, start=None, end=None, max_points: int = 1000) -> dict:
+        """GET /api/history?from=&to=: произвольный период (Unix, UTC). С SD-картой читается весь период
+        хранения, без неё - только буфер в ОЗУ. Чтение с карты может занять секунды."""
+        params = {"max": int(max_points)}
+        if start is not None:
+            params["from"] = int(start)
+        if end is not None:
+            params["to"] = int(end)
+        return self.get_json("/api/history", params, timeout=120)
+
     def measure(self, store: bool = False) -> dict:
         return self.post_json("/api/measure", params={"store": 1} if store else None)
 
@@ -121,12 +155,86 @@ class BarographClient:
         return []
 
     def export_csv_text(self) -> str:
+        """GET /api/export.csv: только буфер в ОЗУ устройства (последние 72 ч и больше)."""
         raw = self._request("GET", "/api/export.csv", timeout=60)
         return raw.decode("utf-8-sig", errors="replace")
 
     def download_records(self) -> list:
         """Вся история из ОЗУ устройства (до 72 ч) в сыром виде, без усреднения."""
         return parse_csv_text(self.export_csv_text())
+
+    def download_csv(self, dest, start=None, end=None, progress=None) -> dict:
+        """Сохраняет CSV с устройства в файл dest.
+
+        Основной путь - GET /api/export/full.csv: полный файл с SD-карты за всё время хранения или только
+        период start..end (Unix, UTC, включительно). Если SD-карты нет (503 sd_offline), берётся буфер ОЗУ
+        (/api/export.csv, последние ≥72 ч) и отфильтровывается по периоду здесь.
+        Файл пишется во временный dest+".part" и переименовывается после успешной загрузки.
+        progress(байт_получено) вызывается по ходу загрузки. Возвращает {"source": "sd"|"ram", "rows", "bytes"}."""
+        dest = str(dest)
+        part = dest + ".part"
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        params = {}
+        if start is not None:
+            params["from"] = int(start)
+        if end is not None:
+            params["to"] = int(end)
+        try:
+            try:
+                size, lines = self._stream_to_file("/api/export/full.csv", params, part, progress)
+                source = "sd"
+            except DeviceError as e:
+                if e.error != "sd_offline" and e.code != 404:     # 404 - прошивка старой версии без этого маршрута
+                    raise
+                size, lines = self._ram_csv_to_file(part, start, end, progress)
+                source = "ram"
+            if size == 0:
+                raise DeviceError("Устройство вернуло пустой файл (SD-карта недоступна?)")
+            os.replace(part, dest)
+        except BaseException:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            raise
+        return {"source": source, "rows": max(0, lines - 1), "bytes": size}
+
+    def _stream_to_file(self, path, params, dest, progress):
+        """Потоковая загрузка в файл. Возвращает (байт, число строк)."""
+        resp = self._open("GET", path, params, timeout=60)
+        size = lines = 0
+        try:
+            with resp, open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(_CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    size += len(chunk)
+                    lines += chunk.count(b"\n")
+                    if progress:
+                        progress(size)
+        except (OSError, TimeoutError, http.client.HTTPException) as e:
+            raise DeviceError(f"Обрыв связи при загрузке файла: {e}") from None
+        return size, lines
+
+    def _ram_csv_to_file(self, dest, start, end, progress):
+        text = self.export_csv_text()
+        out = [CSV_HEADER]
+        for line in text.splitlines():
+            head = line.split(",", 1)[0]
+            if not head.isdigit():
+                continue                                      # заголовок и мусор
+            ts = int(head)
+            if (start is not None and ts < start) or (end is not None and ts > end):
+                continue
+            out.append(line)
+        data = ("\n".join(out) + "\n").encode("utf-8")
+        with open(dest, "wb") as f:
+            f.write(data)
+        if progress:
+            progress(len(data))
+        return len(data), len(out)
 
 
 # ---------------------------------------------------------------------- разбор CSV

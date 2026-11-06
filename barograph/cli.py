@@ -6,9 +6,10 @@ import time
 
 from . import __version__
 from .api_client import DeviceError
+from .csvdata import CsvDataset
 from .paths import Config
-from .service import (EXPORT_FORMATS, client_from_config, export_data, import_csv_file, refresh_device_info,
-                      resolve_period, sync_from_device, tz_from_config)
+from .service import (EXPORT_FORMATS, client_from_config, download_device_csv, export_data, import_csv_file,
+                      refresh_device_info, resolve_period, sync_from_device, tz_from_config)
 from .storage import Storage
 from .timeutil import fmt_ts, parse_duration
 from .units import PRESSURE_UNITS, convert_pressure, pressure_label
@@ -34,6 +35,11 @@ def build_parser():
     sub.add_parser("forecast", help="прогноз")
     sp = sub.add_parser("sync", help="скачать историю с устройства в локальную базу")
     sp.add_argument("--loop", type=float, metavar="МИН", help="повторять каждые N минут")
+    sub.add_parser("device-range", help="за какой период у устройства есть измерения (GET /api/range)")
+    sp = sub.add_parser("download-csv", help="скачать CSV с устройства (с SD-карты целиком или за период)")
+    sp.add_argument("--out", required=True, help="файл, в который сохранить CSV")
+    _period_args(sp)
+    sp.add_argument("--import", dest="do_import", action="store_true", help="после загрузки добавить в локальную базу")
     sub.add_parser("set-time", help="установить время устройства с этого компьютера (если нет NTP)")
     sub.add_parser("wifi-scan", help="сканировать Wi-Fi сети устройством")
 
@@ -43,11 +49,14 @@ def build_parser():
     sp.add_argument("--measure-interval", type=int, metavar="СЕК")
     sp.add_argument("--record-interval", type=int, metavar="СЕК")
 
-    sp = sub.add_parser("stats", help="статистика по локальной базе")
+    sp = sub.add_parser("stats", help="статистика по локальной базе или по CSV-файлу (--csv)")
     _period_args(sp)
+    sp.add_argument("--csv", metavar="ФАЙЛ", help="брать данные из CSV-файла, а не из базы")
     sp.add_argument("--unit", choices=sorted(PRESSURE_UNITS))
 
-    sp = sub.add_parser("export", help="экспорт данных из локальной базы")
+    sp = sub.add_parser("export", help="экспорт данных из локальной базы или из CSV-файла (--csv); "
+                                       "для графика: --format png")
+    sp.add_argument("--csv", metavar="ФАЙЛ", help="брать данные из CSV-файла, а не из базы (кроме формата sqlite)")
     sp.add_argument("--format", required=True, choices=[v[0] for v in EXPORT_FORMATS.values()])
     sp.add_argument("--out", required=True, help="выходной файл")
     _period_args(sp)
@@ -87,6 +96,22 @@ def main(argv=None) -> int:
             print(json.dumps(client_from_config(cfg, args.host, args.port).current(), ensure_ascii=False, indent=2))
         elif args.cmd == "forecast":
             print(json.dumps(client_from_config(cfg, args.host, args.port).forecast(), ensure_ascii=False, indent=2))
+        elif args.cmd == "device-range":
+            print(json.dumps(client_from_config(cfg, args.host, args.port).range(), ensure_ascii=False, indent=2))
+        elif args.cmd == "download-csv":
+            cl = client_from_config(cfg, args.host, args.port)
+            refresh_device_info(cl, cfg)
+            tz = tz_from_config(cfg)
+            res = download_device_csv(cl, args.out, _spec(args), tz)
+            cfg.save()
+            src = "SD-карты" if res["source"] == "sd" else "буфера ОЗУ (SD-карты нет)"
+            print(f"Скачано строк: {res['rows']} ({res['bytes']} байт) из {src} -> {args.out}")
+            if not res["rows"]:
+                print("За выбранный период записей нет", file=sys.stderr)
+                return 1
+            if args.do_import:
+                parsed, new = import_csv_file(Storage(cfg["db_path"]), args.out)
+                print(f"В базу: разобрано {parsed}, новых добавлено {new}")
         elif args.cmd == "set-time":
             print(json.dumps(client_from_config(cfg, args.host, args.port).set_time(), ensure_ascii=False, indent=2))
         elif args.cmd == "wifi-scan":
@@ -123,8 +148,14 @@ def main(argv=None) -> int:
             parsed, new = import_csv_file(Storage(cfg["db_path"]), args.file)
             print(f"Разобрано записей: {parsed}, новых добавлено: {new}")
         elif args.cmd in ("stats", "export"):
-            storage = Storage(cfg["db_path"])
-            start, end = resolve_period(_spec(args), tz, storage)
+            if args.csv:
+                if args.cmd == "export" and args.format == "sqlite":
+                    raise ValueError("Формат sqlite делается из локальной базы: сначала выполните import-csv")
+                storage = CsvDataset.from_file(args.csv)
+                start, end = resolve_period(_spec(args), tz, storage, relative_to_data=True)
+            else:
+                storage = Storage(cfg["db_path"])
+                start, end = resolve_period(_spec(args), tz, storage)
             unit = args.unit or cfg["pressure_unit"]
             if args.cmd == "stats":
                 st = storage.stats(start, end)

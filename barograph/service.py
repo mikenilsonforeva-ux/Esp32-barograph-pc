@@ -51,8 +51,14 @@ def import_csv_file(storage: Storage, path) -> tuple:
     return len(records), storage.insert_many(records)
 
 
-def resolve_period(spec, tz, storage: Storage, now=None):
-    """spec: ('hours', N) | ('all',) | ('custom', 'начало', 'конец'). Возвращает (start, end) в Unix-времени."""
+def resolve_period(spec, tz, storage, now=None, relative_to_data=False):
+    """spec: ('hours', N) | ('all',) | ('custom', 'начало', 'конец'). Возвращает (start, end) в Unix-времени.
+    storage - Storage или CsvDataset (нужен только bounds()). relative_to_data=True: «последние N часов» и
+    пустой конец периода отсчитываются от последней записи источника, а не от текущего времени
+    (нужно для CSV-файла, снятого давно)."""
+    if now is None and relative_to_data:
+        b = storage.bounds()
+        now = b[1] if b else None
     now = int(now if now is not None else time.time())
     kind = spec[0]
     if kind == "hours":
@@ -69,7 +75,34 @@ def resolve_period(spec, tz, storage: Storage, now=None):
     raise ValueError(f"Неизвестный тип периода: {kind}")
 
 
-def export_data(storage: Storage, fmt: str, path, start, end, tz, unit="mmHg",
+def device_period_params(spec, tz, now=None):
+    """Период для запроса к устройству (from/to в API). Возвращает (start, end), None - граница не задана:
+    ('all',) -> (None, None); ('hours', N) -> (сейчас - N ч, None); ('custom', ...) -> заданные даты."""
+    now = int(now if now is not None else time.time())
+    kind = spec[0]
+    if kind == "all":
+        return None, None
+    if kind == "hours":
+        return now - int(float(spec[1]) * 3600), None
+    if kind == "custom":
+        start = parse_datetime(spec[1], tz) if spec[1].strip() else None
+        end = parse_datetime(spec[2], tz, end=True) if spec[2].strip() else None
+        if start is not None and end is not None and end <= start:
+            raise ValueError("Конец периода должен быть позже начала")
+        return start, end
+    raise ValueError(f"Неизвестный тип периода: {kind}")
+
+
+def download_device_csv(client: BarographClient, dest, spec, tz, progress=None) -> dict:
+    """Скачивает CSV с устройства в файл dest (весь, с SD-карты, или за период spec).
+    Возвращает {"source": "sd"|"ram", "rows", "bytes", "start", "end"}."""
+    start, end = device_period_params(spec, tz)
+    res = client.download_csv(dest, start, end, progress)
+    res.update(start=start, end=end)
+    return res
+
+
+def export_data(storage, fmt: str, path, start, end, tz, unit="mmHg",
                 resample_s=0, excel_ru=False, metrics=("pressure", "temperature", "humidity")) -> int:
     """Единая точка экспорта. fmt: csv | xlsx | sqlite | json | png. Возвращает число записей."""
     path = str(path)

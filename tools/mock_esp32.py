@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Имитатор барографа ESP32 (тот же REST API, что в прошивке) - для проверки приложения без железа.
 
-    python tools/mock_esp32.py --port 8080 [--bmp] [--hours 72]
+    python tools/mock_esp32.py --port 8080 [--bmp] [--hours 72] [--sd-hours 240] [--no-sd]
 затем в приложении: хост 127.0.0.1, порт 8080.
+
+--hours      сколько истории в буфере ОЗУ (как у прошивки, не меньше 72 ч)
+--sd-hours   сколько истории лежит на «SD-карте» (CSV, включая буфер ОЗУ); /api/range, /api/history?from=&to=
+             и /api/export/full.csv читают её, как прошивка
+--no-sd      имитировать отсутствие карты: /api/export/full.csv отвечает 503 sd_offline, период - только из ОЗУ
 """
 import argparse
 import json
@@ -14,11 +19,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 TZ_OFFSET = 10800
+CSV_HEADER = "timestamp,date,time,pressure_mmHg,temperature_c,humidity"
+U32_MAX = 0xFFFFFFFE
+
+
+def parse_u32(text):
+    """Как parseU32 в прошивке: только цифры, не больше 4294967294; иначе None."""
+    if text is None or not text.isdigit() or int(text) > U32_MAX:
+        return None
+    return int(text)
+
+
+def csv_line(r):
+    ts, p, t, h = r
+    tt = time.gmtime(ts + TZ_OFFSET)
+    return (f"{ts},{time.strftime('%Y-%m-%d', tt)},{time.strftime('%H:%M:%S', tt)},"
+            f"{p:.2f},{t:.1f},{'' if h is None else f'{h:.1f}'}")
 
 
 class MockDevice:
-    def __init__(self, hours=72, has_humidity=True, ntp=True, record_interval=60):
+    def __init__(self, hours=72, has_humidity=True, ntp=True, record_interval=60, sd_hours=0, sd=True):
         self.lock = threading.Lock()
+        self.sd = sd
         self.has_humidity = has_humidity
         self.ntp = ntp
         self.time_set_by_client = False
@@ -30,11 +52,22 @@ class MockDevice:
         self.t0 = time.time()
         now = int(time.time()) // record_interval * record_interval
         n = int(hours * 3600 / record_interval)
+        total = max(n, int(sd_hours * 3600 / record_interval))
         rnd = random.Random(42)
-        self.records = []
-        for i in range(n):
-            ts = now - (n - 1 - i) * record_interval
-            self.records.append(self._make(ts, rnd))
+        allrec = []
+        for i in range(total):
+            ts = now - (total - 1 - i) * record_interval
+            allrec.append(self._make(ts, rnd))
+        self.records = allrec[total - n:]          # буфер ОЗУ: последние hours часов
+        self.older = allrec[:total - n]            # то, что есть только на SD-карте
+
+    def sd_rows(self):
+        """Всё, что лежит в CSV на карте (старое + буфер); None, если карты нет."""
+        return self.older + self.records if self.sd else None
+
+    def range_rows(self):
+        """Записи, доступные для периода: с карты или только из ОЗУ."""
+        return self.older + self.records if self.sd else self.records
 
     def _make(self, ts, rnd=None):
         rnd = rnd or random
@@ -113,6 +146,7 @@ def make_handler(dev: MockDevice):
                     "/api/current": self.current, "/api/status": self.status, "/api/forecast": self.forecast,
                     "/api/history": self.history, "/api/measure": self.measure, "/api/settings": self.settings,
                     "/api/wifi/scan": self.scan, "/api/time": self.time_api, "/api/export.csv": self.export,
+                    "/api/range": self.range_api, "/api/export/full.csv": self.export_full,
                 }.get(path)
                 if fn is None:
                     return self.err(404, "not_found")
@@ -129,13 +163,13 @@ def make_handler(dev: MockDevice):
             ts = int(time.time())
             self.send_json({
                 "wifi": True, "wifi_state": "connected", "ssid": dev.ssid, "ip": "127.0.0.1", "rssi": -52, "ap": False,
-                "mdns": "esp32-barograf.local", "sd": True, "sd_card_mb": 7580, "csv_bytes": 183450,
-                "csv_file": "barograph.csv", "storage": "sd", "flash_ok": True, "flash_records": 0,
+                "mdns": "esp32-barograf.local", "sd": dev.sd, "sd_card_mb": 7580, "csv_bytes": 183450,
+                "csv_file": "barograph.csv", "storage": "sd" if dev.sd else "flash", "flash_ok": True, "flash_records": 0,
                 "sensor": "BME280" if dev.has_humidity else "BMP280", "sensor_state": "ok", "sensor_address": "0x76",
                 "uptime": int(time.time() - dev.t0), "free_heap": 180000, "history_records": len(dev.records),
                 "history_capacity": 4782, "time_synced": True, "ntp_synced": dev.ntp,
                 "time_source": "ntp" if dev.ntp else "browser", "epoch": ts, "datetime": iso(ts),
-                "tz_offset_s": TZ_OFFSET, "fw_version": "1.0.0"})
+                "tz_offset_s": TZ_OFFSET, "fw_version": "1.1.0"})
 
         def forecast(self, m, q):
             self.send_json({"valid": True, "data_span_s": 18000, "pressure": dev.records[-1][1], "trend": "falling",
@@ -145,7 +179,60 @@ def make_handler(dev: MockDevice):
                             "icon": "cloud", "windy": False, "summary": "Вероятно ухудшение погоды",
                             "details": "Давление медленно падает.", "probability_worse": 52, "probability_better": 11})
 
+        def range_api(self, m, q):
+            rows = dev.range_rows()
+            if not rows:
+                return self.send_json({"has_data": False, "first": None, "first_iso": None, "last": None,
+                                       "last_iso": None, "source": "sd" if dev.sd else "ram"})
+            self.send_json({"has_data": True, "first": rows[0][0], "first_iso": iso(rows[0][0]),
+                            "last": rows[-1][0], "last_iso": iso(rows[-1][0]), "source": "sd" if dev.sd else "ram"})
+
+        def history_range(self, q):
+            """/api/history?from=&to=&max= - как handleHistoryRange в прошивке."""
+            mp = min(2000, max(10, int(q.get("max", 400))))
+            rows = dev.range_rows()
+            has = bool(rows)
+            first, last = (rows[0][0], rows[-1][0]) if has else (0, 0)
+            frm, to = first, last
+            if "from" in q:
+                frm = parse_u32(q["from"])
+                if frm is None:
+                    return self.err(400, "invalid_from")
+            if "to" in q:
+                to = parse_u32(q["to"])
+                if to is None:
+                    return self.err(400, "invalid_to")
+            if "from" in q and "to" in q and to <= frm:
+                return self.err(400, "invalid_range")
+            if has:
+                frm, to = max(frm, first), min(to, last)
+            if not has or frm > to:
+                return self.send_json({"from": None, "to": None, "step_s": 0, "source": "ram", "sampled": False,
+                                       "raw_count": 0, "count": 0, "data": []})
+            step = max(1, -(-(to - frm + 1) // mp))
+            groups, raw = {}, 0
+            for r in rows:
+                if r[0] < frm:
+                    continue
+                if r[0] > to:
+                    break
+                groups.setdefault((r[0] - frm) // step, []).append(r)
+                raw += 1
+            out = []
+            for k in sorted(groups):
+                g = groups[k]
+                hs = [r[3] for r in g if r[3] is not None]
+                out.append({"timestamp": int(sum(r[0] for r in g) / len(g) + 0.5),
+                            "pressure": round(sum(r[1] for r in g) / len(g), 2),
+                            "temperature": round(sum(r[2] for r in g) / len(g), 1),
+                            "humidity": round(sum(hs) / len(hs), 1) if hs else None})
+            self.send_json({"from": frm, "to": to, "step_s": step, "record_interval_s": dev.record_interval,
+                            "data": out, "source": "sd" if dev.sd else "ram", "sampled": False,
+                            "raw_count": raw, "count": len(out)})
+
         def history(self, m, q):
+            if "from" in q or "to" in q:
+                return self.history_range(q)
             hours = float(q.get("hours", 1))
             mx = int(q.get("max", 400))
             cutoff = int(time.time() - hours * 3600)
@@ -216,11 +303,25 @@ def make_handler(dev: MockDevice):
                             "source": "ntp" if dev.ntp else "browser", "epoch": ts, "datetime": iso(ts)})
 
         def export(self, m, q):
-            lines = ["timestamp,date,time,pressure_mmHg,temperature_c,humidity"]
-            for ts, p, t, h in dev.records:
-                tt = time.gmtime(ts + TZ_OFFSET)
-                lines.append(f"{ts},{time.strftime('%Y-%m-%d', tt)},{time.strftime('%H:%M:%S', tt)},"
-                             f"{p:.2f},{t:.1f},{'' if h is None else f'{h:.1f}'}")
+            lines = [CSV_HEADER] + [csv_line(r) for r in dev.records]
+            self.send_chunked("\n".join(lines) + "\n")
+
+        def export_full(self, m, q):
+            """/api/export/full.csv: CSV с SD-карты целиком или за период from..to (включительно)."""
+            if not dev.sd:
+                return self.err(503, "sd_offline")
+            frm, to = 0, U32_MAX
+            if "from" in q:
+                frm = parse_u32(q["from"])
+                if frm is None:
+                    return self.err(400, "invalid_from")
+            if "to" in q:
+                to = parse_u32(q["to"])
+                if to is None:
+                    return self.err(400, "invalid_to")
+            if "from" in q and "to" in q and to <= frm:
+                return self.err(400, "invalid_range")
+            lines = [CSV_HEADER] + [csv_line(r) for r in dev.sd_rows() if frm <= r[0] <= to]
             self.send_chunked("\n".join(lines) + "\n")
 
     return Handler
@@ -238,9 +339,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--hours", type=float, default=72)
+    ap.add_argument("--sd-hours", type=float, default=240, help="сколько истории на SD-карте, ч (по умолчанию 240)")
+    ap.add_argument("--no-sd", action="store_true", help="имитировать отсутствие SD-карты")
     ap.add_argument("--bmp", action="store_true", help="датчик без влажности (BMP280)")
     a = ap.parse_args()
-    srv, port, _ = start_mock(a.port, hours=a.hours, has_humidity=not a.bmp)
+    srv, port, _ = start_mock(a.port, hours=a.hours, has_humidity=not a.bmp, sd_hours=a.sd_hours, sd=not a.no_sd)
     print(f"Имитатор барографа: http://127.0.0.1:{port}  (Ctrl+C - выход)")
     try:
         while True:

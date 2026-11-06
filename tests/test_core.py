@@ -73,7 +73,7 @@ class CoreTests(unittest.TestCase):
 
     def test_05_fallback_host(self):
         c = BarographClient("no-such-host.invalid", self.port, timeout=2, fallback_hosts=["127.0.0.1"])
-        self.assertEqual(c.status()["fw_version"], "1.0.0")
+        self.assertEqual(c.status()["fw_version"], "1.1.0")
         self.assertEqual(c.active_host, "127.0.0.1")
 
     # ---------------- CSV

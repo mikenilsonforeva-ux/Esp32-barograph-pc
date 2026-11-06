@@ -13,8 +13,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 
 from . import __version__, plotting
 from .api_client import DeviceError
-from .service import (EXPORT_FORMATS, PERIOD_PRESETS, RESAMPLE_PRESETS, client_from_config, export_data,
-                      import_csv_file, refresh_device_info, resolve_period, sync_from_device, tz_from_config)
+from .csvdata import CsvDataset
+from .service import (EXPORT_FORMATS, PERIOD_PRESETS, RESAMPLE_PRESETS, client_from_config, device_period_params,
+                      download_device_csv, export_data, import_csv_file, refresh_device_info, resolve_period,
+                      sync_from_device, tz_from_config)
 from .storage import Storage
 from .timeutil import fmt_ts, local_offset_s
 from .units import PRESSURE_UNITS, convert_pressure, pressure_label
@@ -23,6 +25,7 @@ from .units import PRESSURE_UNITS, convert_pressure, pressure_label
 WEATHER_ICONS = {"sun": "☀", "partly": "⛅", "cloud": "☁", "rain": "☂", "storm": "⚡", "snow": "❄", "unknown": "…"}
 MEASURE_VALUES = [5, 10, 30, 60, 300, 600, 1800, 3600]
 RECORD_VALUES = [60, 120, 300, 600, 1800, 3600]
+SOURCE_DB, SOURCE_CSV = "Локальная база", "CSV-файл"          # откуда брать данные для графика
 
 
 def open_path(path):
@@ -77,6 +80,15 @@ class PeriodSelector(ttk.Frame):
         if not self.end_var.get():
             self.end_var.set(end_text)
 
+    def set_custom(self, start_text, end_text):
+        """Записать даты «своего периода» (перезаписывает введённые)."""
+        self.start_var.set(start_text)
+        self.end_var.set(end_text)
+
+    def select(self, label):
+        self.var.set(label)
+        self._apply_state()
+
     def spec(self):
         label = self.var.get()
         for name, value in PERIOD_PRESETS:
@@ -103,6 +115,8 @@ class App(tk.Tk):
         self._last_live = 0.0
         self._last_sync = 0.0
         self._scan_busy = False
+        self._dl_busy = False
+        self.csv_ds = None                  # открытый CSV-файл (источник графика «CSV-файл»)
         try:
             self.storage = Storage(cfg["db_path"])
         except OSError as e:
@@ -381,6 +395,18 @@ class App(tk.Tk):
     def _build_data_tab(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="  Данные и график  ")
+        src = ttk.Frame(tab)
+        src.pack(fill="x", padx=8, pady=(6, 0))
+        ttk.Label(src, text="Источник:").pack(side="left")
+        self.source_var = tk.StringVar(value=SOURCE_DB)
+        sc = ttk.Combobox(src, textvariable=self.source_var, values=[SOURCE_DB, SOURCE_CSV], state="readonly",
+                          width=16)
+        sc.pack(side="left", padx=4)
+        sc.bind("<<ComboboxSelected>>", self._source_changed)
+        self.csv_path_var = tk.StringVar()
+        self.csv_info = ttk.Label(src, text="", foreground="gray")
+        self.csv_widgets = [ttk.Entry(src, textvariable=self.csv_path_var, state="readonly", width=46),
+                            ttk.Button(src, text="Открыть CSV…", command=self.open_csv_file), self.csv_info]
         top = ttk.Frame(tab)
         top.pack(fill="x", padx=8, pady=6)
         self.period_plot = PeriodSelector(top, default="24 часа", on_change=self._period_changed)
@@ -417,26 +443,96 @@ class App(tk.Tk):
     def selected_metrics(self):
         return [k for k, v in self.metric_vars.items() if v.get()]
 
+    # ---- источник данных графика: локальная база или CSV-файл
+    def data_source(self):
+        """Storage или CsvDataset (None - выбран CSV, но файл ещё не открыт)."""
+        return self.csv_ds if self.source_var.get() == SOURCE_CSV else self.storage
+
+    def _layout_source(self):
+        for w in self.csv_widgets:
+            w.pack_forget()
+        if self.source_var.get() == SOURCE_CSV:
+            self.csv_widgets[0].pack(side="left", padx=4)
+            self.csv_widgets[1].pack(side="left")
+            self.csv_widgets[2].pack(side="left", padx=8)
+
+    def _source_changed(self, _event=None):
+        self._layout_source()
+        if self.source_var.get() == SOURCE_CSV and self.csv_ds is None:
+            self.open_csv_file()
+        else:
+            self.replot()
+
+    def open_csv_file(self, path=None):
+        """Выбрать (или открыть указанный) CSV-файл барографа и построить по нему график."""
+        if not path:
+            path = filedialog.askopenfilename(
+                title="CSV-файл барографа", filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+                initialdir=self.cfg["export_dir"])
+        if not path:
+            if self.csv_ds is None:                              # отказались выбирать - вернуться к базе
+                self.source_var.set(SOURCE_DB)
+                self._source_changed()
+            return
+        self.cfg["export_dir"] = os.path.dirname(path)
+        self.log(f"Чтение CSV: {path}")
+
+        def ok(ds):
+            self.csv_ds = ds
+            self.csv_path_var.set(path)
+            tz = self.tz()
+            lo, hi = ds.bounds()
+            a, b = fmt_ts(lo, tz, "%d.%m.%Y %H:%M"), fmt_ts(hi, tz, "%d.%m.%Y %H:%M")
+            skipped = f", пропущено строк: {ds.skipped}" if ds.skipped else ""
+            self.csv_info.configure(text=f"{ds.count()} записей ({a} — {b}){skipped}")
+            self.period_plot.set_custom(a, b)                    # «Свой период» сразу содержит границы файла
+            self.period_plot.select("Всё время")
+            self.log(f"CSV загружен: {ds.count()} записей ({a} — {b}){skipped}")
+            self.replot()
+
+        def err(e):
+            self.log(f"CSV не прочитан: {e}")
+            messagebox.showerror("CSV-файл", str(e))
+            if self.csv_ds is None:
+                self.source_var.set(SOURCE_DB)
+                self._source_changed()
+        self.bg(lambda: CsvDataset.from_file(path), ok, err)
+
+    def show_csv_in_plot(self, path):
+        """Открыть файл на вкладке графика (например, сразу после скачивания с устройства)."""
+        self.source_var.set(SOURCE_CSV)
+        self._layout_source()
+        self.nb.select(1)
+        self.open_csv_file(path)
+
     def replot(self):
+        csv_mode = self.source_var.get() == SOURCE_CSV
+        src = self.data_source()
+        metrics = self.selected_metrics()
+        if src is None:
+            plotting.draw_figure(self.fig, [], metrics, self.tz(), self.unit())
+            self.canvas.draw_idle()
+            self.stats_var.set("Откройте CSV-файл кнопкой «Открыть CSV…».")
+            return
         try:
-            start, end = resolve_period(self.period_plot.spec(), self.tz(), self.storage)
+            start, end = resolve_period(self.period_plot.spec(), self.tz(), src, relative_to_data=csv_mode)
         except ValueError as e:
             messagebox.showerror("Период", str(e))
             return
-        metrics = self.selected_metrics()
 
         def job():
-            return self.storage.query(start, end, max_points=3000), self.storage.stats(start, end)
-        self.bg(job, lambda res: self._plot_done(res, metrics))
+            return src.query(start, end, max_points=3000), src.stats(start, end)
+        self.bg(job, lambda res: self._plot_done(res, metrics, csv_mode))
 
-    def _plot_done(self, res, metrics):
+    def _plot_done(self, res, metrics, csv_mode=False):
         rows, st = res
         tz, unit = self.tz(), self.unit()
         plotting.draw_figure(self.fig, rows, metrics, tz, unit)
         self.canvas.draw_idle()
         self.toolbar.update()
         if not st["count"]:
-            self.stats_var.set("Нет данных за период. Нажмите «Загрузить с устройства» или импортируйте CSV на вкладке «Экспорт».")
+            self.stats_var.set("В этом периоде в CSV-файле нет записей." if csv_mode else
+                               "Нет данных за период. Нажмите «Загрузить с устройства» или импортируйте CSV на вкладке «Экспорт».")
             return
         p = st["pressure"]
         lines = [f"Записей: {st['count']}   ({fmt_ts(st['first_ts'], tz)} — {fmt_ts(st['last_ts'], tz)})",
@@ -451,8 +547,13 @@ class App(tk.Tk):
         self.stats_var.set("\n".join(lines))
 
     def save_png(self):
+        csv_mode = self.source_var.get() == SOURCE_CSV
+        src = self.data_source()
+        if src is None:
+            messagebox.showinfo("График", "Сначала откройте CSV-файл.")
+            return
         try:
-            start, end = resolve_period(self.period_plot.spec(), self.tz(), self.storage)
+            start, end = resolve_period(self.period_plot.spec(), self.tz(), src, relative_to_data=csv_mode)
         except ValueError as e:
             messagebox.showerror("Период", str(e))
             return
@@ -464,7 +565,7 @@ class App(tk.Tk):
         self.cfg["export_dir"] = os.path.dirname(path)
         metrics = self.selected_metrics()
         tz, unit = self.tz(), self.unit()
-        self.bg(lambda: export_data(self.storage, "png", path, start, end, tz, unit, metrics=metrics),
+        self.bg(lambda: export_data(src, "png", path, start, end, tz, unit, metrics=metrics),
                 lambda n: self.log(f"График сохранён: {path}"))
 
     # ================================================================== синхронизация
@@ -531,6 +632,36 @@ class App(tk.Tk):
             "(полезно для Excel и длинных периодов). SQLite-экспорт создаёт новую базу с той же структурой.")).pack(
             anchor="w", padx=8, pady=(0, 8))
 
+        dev = ttk.LabelFrame(tab, text="Выгрузка CSV с устройства")
+        dev.pack(fill="x", padx=12, pady=6)
+        self.period_dl = PeriodSelector(dev, default="Всё время", on_change=self._period_changed)
+        self.period_dl.pack(anchor="w", padx=8, pady=(8, 4))
+        rr = ttk.Frame(dev)
+        rr.pack(fill="x", padx=8, pady=2)
+        ttk.Button(rr, text="Что есть на устройстве", command=self.check_device_range).pack(side="left")
+        self.dev_range_var = tk.StringVar(value="")
+        ttk.Label(rr, textvariable=self.dev_range_var, foreground="gray").pack(side="left", padx=10)
+        r3 = ttk.Frame(dev)
+        r3.pack(fill="x", padx=8, pady=6)
+        ttk.Label(r3, text="Файл:").pack(side="left")
+        self.dl_out_var = tk.StringVar()
+        ttk.Entry(r3, textvariable=self.dl_out_var).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(r3, text="Обзор…", command=self.browse_dl).pack(side="left")
+        r4 = ttk.Frame(dev)
+        r4.pack(fill="x", padx=8, pady=2)
+        self.dl_button = ttk.Button(r4, text="Скачать CSV с устройства", command=self.download_device_csv_file)
+        self.dl_button.pack(side="left")
+        self.dl_plot_var = tk.BooleanVar(value=True)
+        self.dl_import_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r4, text="показать график", variable=self.dl_plot_var).pack(side="left", padx=(14, 4))
+        ttk.Checkbutton(r4, text="добавить в локальную базу", variable=self.dl_import_var).pack(side="left", padx=4)
+        self.dl_status_var = tk.StringVar(value="")
+        ttk.Label(dev, textvariable=self.dl_status_var, foreground="gray").pack(anchor="w", padx=8, pady=(4, 0))
+        ttk.Label(dev, foreground="gray", wraplength=900, justify="left", text=(
+            "Без периода скачивается весь файл с SD-карты (за всё время хранения; это может занять несколько минут). "
+            "С периодом - только он. Если SD-карты нет, берётся буфер в памяти устройства (последние 72 часа и больше).")
+                  ).pack(anchor="w", padx=8, pady=(2, 8))
+
         imp = ttk.LabelFrame(tab, text="Импорт")
         imp.pack(fill="x", padx=12, pady=6)
         ttk.Label(imp, wraplength=900, justify="left", text=(
@@ -544,6 +675,8 @@ class App(tk.Tk):
         cur = self.out_var.get().strip()
         if force or not cur:
             self.out_var.set(os.path.join(self.cfg["export_dir"], time.strftime("barograph_%Y%m%d_%H%M") + ext))
+        if not self.dl_out_var.get().strip():
+            self.dl_out_var.set(os.path.join(self.cfg["export_dir"], time.strftime("barograph_device_%Y%m%d_%H%M.csv")))
 
     def browse_out(self):
         fmt_name = self.fmt_var.get()
@@ -595,6 +728,109 @@ class App(tk.Tk):
             messagebox.showinfo("Импорт", f"Разобрано записей: {parsed}\nНовых добавлено: {new}")
             self.update_db_info()
         self.bg(lambda: import_csv_file(self.storage, path), ok)
+
+    # ---- выгрузка CSV с устройства
+    def browse_dl(self):
+        path = filedialog.asksaveasfilename(
+            title="Куда сохранить CSV", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+            initialdir=self.cfg["export_dir"], initialfile=os.path.basename(self.dl_out_var.get()))
+        if path:
+            self.dl_out_var.set(path)
+            self.cfg["export_dir"] = os.path.dirname(path)
+
+    def check_device_range(self):
+        """GET /api/range: за какой период у устройства есть записи; даты подставляются в «Свой период»."""
+        cl = self.client()
+        self.dev_range_var.set("Запрос…")
+
+        def job():
+            refresh_device_info(cl, self.cfg)                    # заодно часовой пояс устройства
+            return cl.range()
+
+        def ok(r):
+            self.cfg.save()
+            if not r.get("has_data"):
+                self.dev_range_var.set("На устройстве пока нет записей")
+                return
+            tz = self.tz()
+            a, b = fmt_ts(r["first"], tz, "%d.%m.%Y %H:%M"), fmt_ts(r["last"], tz, "%d.%m.%Y %H:%M")
+            src = "SD-карта" if r.get("source") == "sd" else "буфер памяти, SD-карты нет"
+            self.dev_range_var.set(f"На устройстве: {a} — {b} ({src})")
+            self.period_dl.set_custom(a, b)
+
+        def err(e):
+            self.dev_range_var.set("")
+            self._generic_err(e)
+        self.bg(job, ok, err)
+
+    def download_device_csv_file(self):
+        if self._dl_busy:
+            return
+        path = self.dl_out_var.get().strip()
+        if not path:
+            messagebox.showwarning("Скачивание", "Укажите файл")
+            return
+        spec = self.period_dl.spec()
+        try:
+            device_period_params(spec, self.tz())                # проверить даты до запуска
+        except ValueError as e:
+            messagebox.showerror("Период", str(e))
+            return
+        if os.path.exists(path) and not messagebox.askyesno("Файл существует", f"Перезаписать файл?\n{path}"):
+            return
+        self._dl_busy = True
+        self.dl_button.configure(state="disabled")
+        self.dl_status_var.set("Подключение…")
+        self.log(f"Скачивание CSV с устройства → {path}")
+        cl = self.client()
+        do_import = self.dl_import_var.get()
+        last_ui = [0.0]
+
+        def progress(n):
+            now = time.time()
+            if now - last_ui[0] >= 0.3:                          # не заваливать очередь обновлений окна
+                last_ui[0] = now
+                self._q.put((self._dl_progress, n))
+
+        def job():
+            refresh_device_info(cl, self.cfg)
+            res = download_device_csv(cl, path, spec, tz_from_config(self.cfg), progress)
+            if do_import and res["rows"]:
+                res["import"] = import_csv_file(self.storage, path)
+            return res
+
+        def finish():
+            self._dl_busy = False
+            self.dl_button.configure(state="normal")
+
+        def ok(res):
+            finish()
+            self.cfg.save()
+            src = "SD-карты" if res["source"] == "sd" else "буфера памяти устройства (SD-карты нет)"
+            msg = f"Скачано записей: {res['rows']} ({res['bytes'] // 1024} КБ) из {src}"
+            self.dl_status_var.set(msg)
+            self.log(f"{msg} → {path}")
+            if "import" in res:
+                parsed, new = res["import"]
+                self.log(f"В локальную базу: разобрано {parsed}, новых {new}")
+                self.update_db_info()
+            if not res["rows"]:
+                messagebox.showinfo("Скачивание", "За выбранный период на устройстве нет записей. "
+                                                  "Сохранён файл только с заголовком.")
+                return
+            if self.dl_plot_var.get():
+                self.show_csv_in_plot(path)
+
+        def err(e):
+            finish()
+            self.dl_status_var.set("")
+            self.log(f"Скачивание не удалось: {e}")
+            messagebox.showerror("Скачивание", str(e))
+        self.bg(job, ok, err)
+
+    def _dl_progress(self, n):
+        if self._dl_busy:
+            self.dl_status_var.set(f"Получено {n // 1024} КБ…")
 
     # ================================================================== вкладка 4: настройки устройства
     def _build_device_tab(self):
